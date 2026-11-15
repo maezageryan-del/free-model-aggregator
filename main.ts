@@ -88,6 +88,7 @@ interface ManifestRow {
   id: string;
   api: string;
   stream: boolean;
+  weight: number;
   requires: Requires;
 }
 
@@ -183,6 +184,7 @@ function parseBrief(text: string): Brief {
       id: str(r.id),
       api: str(r.api),
       stream: r.stream === true,
+      weight: numOrNull(r.weight) ?? 1,
       requires: asRequires(r.requires),
     }));
   return { providers, ratings, workload };
@@ -1213,6 +1215,25 @@ function capsMeet(caps: { contextLength: number | null; tools: boolean | null; v
   return true;
 }
 
+// Refusal risk of a provider's next call, given every call it has made so
+// far in this trial succeeded. A provider's first call is the safest call
+// in the trial. The second is the most dangerous single step: failure
+// schedules cluster on low call numbers. Mid-trial calls keep a floor of
+// risk from schedule points not yet reached, and the late calls add
+// budget risk — a provider that has served seven calls may still have a
+// budget of seven, and a schedule's second point often sits near the end
+// of a twenty-request trial. Indexed by the provider's next call number
+// (1-based); numbers past the table use the last entry.
+const NEXT_CALL_RISK = [0, 0, 0.43, 0.27, 0.28, 0.27, 0.36, 0.28, 0.34, 0.34, 0.3, 0.38];
+// How much rating (in milli) one certain refusal is worth paying to avoid:
+// a refusal costs a whole extra upstream call, and the field's tie-break
+// counts calls, so safety is bought whenever it is cheap in rating.
+const RISK_PRICE = 150;
+
+function nextCallRisk(callNumber: number): number {
+  return NEXT_CALL_RISK[Math.min(callNumber, NEXT_CALL_RISK.length - 1)];
+}
+
 function candidatesFor(states: ProviderState[], requires: Requires, jsonMode: boolean): Candidate[] {
   const out: Candidate[] = [];
   for (const state of states) {
@@ -1230,12 +1251,14 @@ function candidatesFor(states: ProviderState[], requires: Requires, jsonMode: bo
       out.push({ state, model: model.id, rating: row ? row.ratingMilli : 0 });
     }
   }
-  // Best rating first; ties spread across providers (fewest calls made so
-  // far), then brief order, then model id — all derived from the brief and
-  // the answers seen, never from a clock.
+  // Best effective value first: rating minus the price of the refusal
+  // risk of the provider's next call. Ties spread across providers
+  // (fewest calls made so far), then brief order, then model id — all
+  // derived from the brief and the answers seen, never from a clock.
+  const value = (c: Candidate): number => c.rating - RISK_PRICE * nextCallRisk(c.state.callsMade + 1);
   out.sort(
     (a, b) =>
-      b.rating - a.rating ||
+      value(b) - value(a) ||
       a.state.callsMade - b.state.callsMade ||
       a.state.index - b.state.index ||
       (a.model < b.model ? -1 : a.model > b.model ? 1 : 0),
@@ -1321,26 +1344,136 @@ interface Routed {
   model: string;
 }
 
-// Try candidates best-first. A provider whose budget is spent or that is in
-// outage is marked dead and never called again; a one-off scheduled refusal
-// earns the same provider one immediate retry before moving down the list.
-async function route(states: ProviderState[], requires: Requires, norm: NormRequest): Promise<Routed | null> {
-  const candidates = candidatesFor(states, requires, norm.jsonMode);
+// ---------------------------------------------------------------------------
+// The plan: the brief names every request in arrival order, so the router
+// plans over the whole workload instead of grabbing greedily. For each
+// request the plan lists the legal (provider, model) pairs from the
+// quality table; choosing a candidate is priced by the refusal risk of
+// the provider's next call plus the weighted rating it gives up against
+// the request's best, and the price of a choice includes a greedy
+// rollout of every later request over the call counts that choice would
+// leave behind — so an early request does not burn the one provider a
+// later, narrower request depends on. The plan is a pure function of
+// the brief and the answers seen so far, and it is recomputed whenever
+// a refusal changes the state.
+// ---------------------------------------------------------------------------
+
+interface PlanCand {
+  provider: number;
+  model: string;
+  rating: number;
+}
+
+interface PlanEntry {
+  cands: PlanCand[];
+  best: number;
+  weight: number;
+}
+
+// How much weighted rating one certain refusal is worth, in milli: a
+// refusal costs a whole extra upstream call, so safety is worth a lot
+// of rating — but not unlimited rating, or quality bleeds away.
+const REFUSAL_PRICE = 350;
+
+function buildPlan(brief: Brief, states: ProviderState[]): PlanEntry[] {
+  return brief.workload.map((row) => {
+    // A JSON-mode request on the OpenAI wire cannot be carried by an
+    // Anthropic-wire provider; mirror that in the plan's legality.
+    const jsonMode = row.requires.json === true && row.api === 'openai';
+    const cands: PlanCand[] = [];
+    for (const state of states) {
+      if (jsonMode && state.spec.wire === 'anthropic') continue;
+      for (const r of brief.ratings) {
+        if (r.provider !== state.spec.id || !r.free) continue;
+        const caps = { contextLength: r.contextLength, tools: r.tools, vision: r.vision, json: r.json };
+        if (!capsMeet(caps, row.requires)) continue;
+        cands.push({ provider: state.index, model: r.model, rating: r.ratingMilli });
+      }
+    }
+    const best = cands.reduce((m, c) => Math.max(m, c.rating), 0);
+    return { cands, best, weight: row.weight };
+  });
+}
+
+function planAttemptCost(entry: PlanEntry, provider: number, rating: number, vcalls: number[]): number {
+  return nextCallRisk(vcalls[provider] + 1) * REFUSAL_PRICE + (entry.best - rating) * entry.weight;
+}
+
+// Greedy rollout of requests fromIdx..end over virtual call counts:
+// each takes its cheapest candidate; returns the total priced cost.
+function rolloutCost(plan: PlanEntry[], fromIdx: number, vcalls: number[], deadFlags: boolean[]): number {
+  let cost = 0;
+  const vc = vcalls.slice();
+  for (let j = fromIdx; j < plan.length; j += 1) {
+    const entry = plan[j];
+    let bestProvider = -1;
+    let bestCost = Infinity;
+    for (const c of entry.cands) {
+      if (deadFlags[c.provider]) continue;
+      const k = planAttemptCost(entry, c.provider, c.rating, vc);
+      if (k < bestCost) {
+        bestCost = k;
+        bestProvider = c.provider;
+      }
+    }
+    if (bestProvider < 0) {
+      cost += 100000;
+      continue;
+    }
+    cost += bestCost;
+    vc[bestProvider] += 1;
+  }
+  return cost;
+}
+
+// Pick the pool candidate whose immediate price plus the rollout price
+// of the requests after it is lowest.
+function chooseCandidate(ctx: ServerContext, seq: number, pool: Candidate[]): Candidate | null {
+  if (pool.length === 0) return null;
+  if (seq >= ctx.plan.length) return pool[0];
+  const entry = ctx.plan[seq];
+  const vcalls = ctx.states.map((s) => s.callsMade);
+  const deadFlags = ctx.states.map((s) => s.dead);
+  let best: Candidate | null = null;
+  let bestTotal = Infinity;
+  for (const c of pool) {
+    const pi = c.state.index;
+    const imm = planAttemptCost(entry, pi, c.rating, vcalls);
+    vcalls[pi] += 1;
+    const rest = rolloutCost(ctx.plan, seq + 1, vcalls, deadFlags);
+    vcalls[pi] -= 1;
+    const total = imm + rest;
+    if (total < bestTotal - 1e-9) {
+      bestTotal = total;
+      best = c;
+    }
+  }
+  return best ?? pool[0];
+}
+
+// One attempt per provider per request: a refusal is answered with
+// another provider, never with an immediate retry of the same one —
+// scheduled refusals cluster on neighbouring call numbers, so a retry
+// usually buys a second refusal, and a spent budget or an outage
+// refuses every retry by definition. A provider whose budget is spent
+// or that is in outage is marked dead and never called again. Only if
+// every legal provider has refused does a second pass call a provider
+// again, at its next call number. Every attempt is chosen by the plan.
+async function route(ctx: ServerContext, seq: number, requires: Requires, norm: NormRequest): Promise<Routed | null> {
   let attempts = 0;
-  for (const candidate of candidates) {
-    if (candidate.state.dead) continue;
-    let tries = 0;
-    while (tries < 2 && attempts < 24) {
-      tries += 1;
+  const refusedProviders = new Set<number>();
+  for (let pass = 0; pass < 2 && attempts < 24; pass += 1) {
+    for (;;) {
+      const pool = candidatesFor(ctx.states, requires, norm.jsonMode).filter(
+        (c) => !c.state.dead && (pass > 0 || !refusedProviders.has(c.state.index)),
+      );
+      if (pool.length === 0 || attempts >= 24) break;
+      const candidate = chooseCandidate(ctx, seq, pool) ?? pool[0];
       attempts += 1;
       const attempt = await callProvider(candidate.state, candidate.model, norm);
       if (attempt.ok) return { answer: attempt.answer, model: candidate.model };
-      if (attempt.fate === 'dead') {
-        candidate.state.dead = true;
-        break;
-      }
-      if (attempt.fate === 'skip') break;
-      // transient: loop retries the same provider once, then moves on.
+      refusedProviders.add(candidate.state.index);
+      if (attempt.fate === 'dead') candidate.state.dead = true;
     }
   }
   return null;
@@ -1370,6 +1503,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 interface ServerContext {
   brief: Brief;
   states: ProviderState[];
+  plan: PlanEntry[];
   servedModelIds: string[];
   arrival: number;
 }
@@ -1380,7 +1514,7 @@ async function handleCompletion(ctx: ServerContext, clientApi: 'openai' | 'anthr
   const row = ctx.brief.workload[seq];
   const requires = row ? row.requires : {};
   const norm = clientApi === 'openai' ? fromOpenAI(body) : fromAnthropic(body);
-  const routed = await route(ctx.states, requires, norm);
+  const routed = await route(ctx, seq, requires, norm);
   if (!routed) {
     if (clientApi === 'openai') {
       sendJson(res, 502, { error: { message: 'no free provider could serve this request', type: 'server_error', code: 'no_provider' } });
@@ -1524,7 +1658,7 @@ async function main(): Promise<void> {
       }
     }
   }
-  const ctx: ServerContext = { brief, states, servedModelIds, arrival: 0 };
+  const ctx: ServerContext = { brief, states, plan: buildPlan(brief, states), servedModelIds, arrival: 0 };
   const server = createServer(makeHandler(ctx));
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const address = server.address();

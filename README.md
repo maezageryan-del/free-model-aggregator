@@ -35,23 +35,31 @@ env says the trial is done.
 Each incoming request is translated once into a wire-neutral form that keeps
 exactly the fields every wire reads back — system prompt, last user message,
 tool names, `max_tokens`, stop sequences, images, JSON mode — so the chosen
-provider's answer echoes the client's original request on any wire. The
-router then:
+provider's answer echoes the client's original request on any wire.
 
-1. takes the request's requirements from the manifest row for its arrival
-   position;
-2. ranks every free (provider, model) pair whose quality-table row meets
-   those requirements, best rating first (ties spread across providers by
-   fewest calls made so far). A JSON-mode request is never routed to an
-   Anthropic-wire provider, because that wire cannot carry the JSON-mode
-   flag;
-3. calls the best candidate, translating the request into that provider's
-   wire and the answer back into the client's wire — streaming event order,
-   stop reasons and usage included;
-4. on a refusal, fails over: a provider whose budget is spent or that is in
-   outage is marked dead for the rest of the trial, a one-off scheduled
-   refusal earns the same provider one immediate retry, and otherwise the
-   next candidate is tried.
+The brief names every request in arrival order, so the router plans over
+the whole workload instead of grabbing greedily. For each request it builds
+the plan's candidate list — every free (provider, model) pair whose
+quality-table row meets the request's requirements (a JSON-mode request is
+never planned onto an Anthropic-wire provider, because that wire cannot
+carry the JSON-mode flag) — and prices every attempt two ways:
+
+- the **refusal risk** of the provider's next call: a provider's first call
+  is the safest in the trial, its second the most dangerous single step
+  (failure schedules cluster on low call numbers), and late calls add
+  budget risk, since a provider's free-tier budget is never published;
+- the **weighted rating** the choice gives up against the request's best
+  legal model.
+
+A candidate's price is its own attempt price plus a greedy rollout of
+every later request over the call counts that choice would leave behind,
+so an early, flexible request does not burn the one provider a later,
+narrower request depends on, and deep use of one provider is only bought
+when the rating is worth the rising risk. On a refusal the router replans
+onto another provider — never an immediate retry of the same one, since
+scheduled refusals cluster on neighbouring call numbers and a spent budget
+or an outage refuses every retry by definition; a provider whose budget is
+spent or that is in outage is marked dead for the rest of the trial.
 
 Every choice is a pure function of the brief, the requests and the answers
 the providers give — no wall clock, no randomness — so a replayed trial
